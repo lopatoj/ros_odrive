@@ -8,6 +8,11 @@
 #include "rclcpp/rclcpp.hpp"
 #include "socket_can.hpp"
 
+#include "transmission_interface/simple_transmission_loader.hpp"
+#include "transmission_interface/transmission.hpp"
+#include "transmission_interface/transmission_interface_exception.hpp"
+
+
 namespace odrive_ros2_control {
 
 class Axis;
@@ -89,6 +94,28 @@ struct Axis {
     bool vel_input_enabled_ = false;
     bool torque_input_enabled_ = false;
 
+    // Actuator commands (ODrive CAN side)
+    double act_pos_setpoint_ = 0.0f;
+    double act_vel_setpoint_ = 0.0f;
+    double act_torque_setpoint_ = 0.0f;
+
+    // Actuator states (ODrive CAN side)
+    double act_pos_estimate_ = 0.0;
+    double act_vel_estimate_ = 0.0;
+    double act_torque_target_ = 0.0;
+    double act_torque_estimate_ = 0.0;
+
+    // Transmission pass-through
+    double tr_joint_pos_ = 0.0;
+    double tr_joint_vel_ = 0.0;
+    double tr_joint_eff_ = 0.0;
+    double tr_act_pos_ = 0.0;
+    double tr_act_vel_ = 0.0;
+    double tr_act_eff_ = 0.0;
+
+    std::shared_ptr<transmission_interface::Transmission> transmission_;
+
+
     template <typename T>
     void send(const T& msg) const {
         struct can_frame frame;
@@ -114,8 +141,38 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
 
     can_intf_name_ = info_.hardware_parameters["can"];
 
-    for (auto& joint : info_.joints) {
+    auto transmission_loader = transmission_interface::SimpleTransmissionLoader();
+
+    axes_.reserve(info_.joints.size());
+    for (size_t i = 0; i < info_.joints.size(); i++) {
+        auto& joint = info_.joints[i];
         axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
+        auto& axis = axes_.back();
+
+        for (const auto& transmission_info : info_.transmissions) {
+            if (!transmission_info.joints.empty() && transmission_info.joints[0].name == joint.name) {
+                try {
+                    axis.transmission_ = transmission_loader.load(transmission_info);
+
+                    std::vector<transmission_interface::JointHandle> joint_handles;
+                    joint_handles.emplace_back(joint.name, hardware_interface::HW_IF_POSITION, &axis.tr_joint_pos_);
+                    joint_handles.emplace_back(joint.name, hardware_interface::HW_IF_VELOCITY, &axis.tr_joint_vel_);
+                    joint_handles.emplace_back(joint.name, hardware_interface::HW_IF_EFFORT, &axis.tr_joint_eff_);
+
+                    std::vector<transmission_interface::ActuatorHandle> actuator_handles;
+                    std::string actuator_name = transmission_info.actuators.empty() ? joint.name + "_actuator" : transmission_info.actuators[0].name;
+                    actuator_handles.emplace_back(actuator_name, hardware_interface::HW_IF_POSITION, &axis.tr_act_pos_);
+                    actuator_handles.emplace_back(actuator_name, hardware_interface::HW_IF_VELOCITY, &axis.tr_act_vel_);
+                    actuator_handles.emplace_back(actuator_name, hardware_interface::HW_IF_EFFORT, &axis.tr_act_eff_);
+
+                    axis.transmission_->configure(joint_handles, actuator_handles);
+                } catch (const transmission_interface::TransmissionInterfaceException& exc) {
+                    RCLCPP_FATAL(rclcpp::get_logger("ODriveHardwareInterface"), "Error while loading %s: %s", transmission_info.name.c_str(), exc.what());
+                    return CallbackReturn::ERROR;
+                }
+                break;
+            }
+        }
     }
 
     return CallbackReturn::SUCCESS;
@@ -167,6 +224,7 @@ CallbackReturn ODriveHardwareInterface::on_deactivate(const State&) {
 std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_state_interfaces() {
     std::vector<hardware_interface::StateInterface> state_interfaces;
 
+    axes_.reserve(info_.joints.size());
     for (size_t i = 0; i < info_.joints.size(); i++) {
         state_interfaces.emplace_back(hardware_interface::StateInterface(
             info_.joints[i].name,
@@ -191,6 +249,7 @@ std::vector<hardware_interface::StateInterface> ODriveHardwareInterface::export_
 std::vector<hardware_interface::CommandInterface> ODriveHardwareInterface::export_command_interfaces() {
     std::vector<hardware_interface::CommandInterface> command_interfaces;
 
+    axes_.reserve(info_.joints.size());
     for (size_t i = 0; i < info_.joints.size(); i++) {
         command_interfaces.emplace_back(hardware_interface::CommandInterface(
             info_.joints[i].name,
@@ -258,26 +317,68 @@ return_type ODriveHardwareInterface::read(const rclcpp::Time& timestamp, const r
         // repeat until CAN interface has no more messages
     }
 
+    for (auto& axis : axes_) {
+        if (axis.transmission_) {
+            axis.tr_act_pos_ = axis.act_pos_estimate_;
+            axis.tr_act_vel_ = axis.act_vel_estimate_;
+            axis.tr_act_eff_ = axis.act_torque_target_;
+
+            axis.tr_joint_pos_ = axis.act_pos_estimate_;
+            axis.tr_joint_vel_ = axis.act_vel_estimate_;
+            axis.tr_joint_eff_ = axis.act_torque_target_;
+
+            axis.transmission_->actuator_to_joint();
+
+            axis.pos_estimate_ = axis.tr_joint_pos_;
+            axis.vel_estimate_ = axis.tr_joint_vel_;
+            axis.torque_target_ = axis.tr_joint_eff_;
+        } else {
+            axis.pos_estimate_ = axis.act_pos_estimate_;
+            axis.vel_estimate_ = axis.act_vel_estimate_;
+            axis.torque_target_ = axis.act_torque_target_;
+        }
+    }
+
     return return_type::OK;
 }
 
 return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Duration&) {
     for (auto& axis : axes_) {
+        if (axis.transmission_) {
+            axis.tr_joint_pos_ = axis.pos_setpoint_;
+            axis.tr_joint_vel_ = axis.vel_setpoint_;
+            axis.tr_joint_eff_ = axis.torque_setpoint_;
+
+            axis.tr_act_pos_ = axis.pos_setpoint_;
+            axis.tr_act_vel_ = axis.vel_setpoint_;
+            axis.tr_act_eff_ = axis.torque_setpoint_;
+
+            axis.transmission_->joint_to_actuator();
+
+            axis.act_pos_setpoint_ = axis.tr_act_pos_;
+            axis.act_vel_setpoint_ = axis.tr_act_vel_;
+            axis.act_torque_setpoint_ = axis.tr_act_eff_;
+        } else {
+            axis.act_pos_setpoint_ = axis.pos_setpoint_;
+            axis.act_vel_setpoint_ = axis.vel_setpoint_;
+            axis.act_torque_setpoint_ = axis.torque_setpoint_;
+        }
+
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
-            msg.Input_Pos = axis.pos_setpoint_ / (2 * M_PI);
-            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
-            msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+            msg.Input_Pos = axis.act_pos_setpoint_ / (2 * M_PI);
+            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.act_vel_setpoint_ / (2 * M_PI)) : 0.0f;
+            msg.Torque_FF = axis.torque_input_enabled_ ? axis.act_torque_setpoint_ : 0.0f;
             axis.send(msg);
         } else if (axis.vel_input_enabled_) {
             Set_Input_Vel_msg_t msg;
-            msg.Input_Vel = axis.vel_setpoint_ / (2 * M_PI);
-            msg.Input_Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+            msg.Input_Vel = axis.act_vel_setpoint_ / (2 * M_PI);
+            msg.Input_Torque_FF = axis.torque_input_enabled_ ? axis.act_torque_setpoint_ : 0.0f;
             axis.send(msg);
         } else if (axis.torque_input_enabled_) {
             Set_Input_Torque_msg_t msg;
-            msg.Input_Torque = axis.torque_setpoint_;
+            msg.Input_Torque = axis.act_torque_setpoint_;
             axis.send(msg);
         } else {
             // no control enabled - don't send any setpoint
@@ -313,7 +414,8 @@ void ODriveHardwareInterface::set_axis_command_mode(const Axis& axis) {
     state_msg.Axis_Requested_State = AXIS_STATE_CLOSED_LOOP_CONTROL;
 
     if (axis.pos_input_enabled_) {
-        RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting to position control.");
+        RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting to filtered position control.");
+        control_msg.Input_Mode = INPUT_MODE_POS_FILTER;
         control_msg.Control_Mode = CONTROL_MODE_POSITION_CONTROL;
     } else if (axis.vel_input_enabled_) {
         RCLCPP_INFO(rclcpp::get_logger("ODriveHardwareInterface"), "Setting to velocity control.");
@@ -348,14 +450,14 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
     switch (cmd) {
         case Get_Encoder_Estimates_msg_t::cmd_id: {
             if (Get_Encoder_Estimates_msg_t msg; try_decode(msg)) {
-                pos_estimate_ = msg.Pos_Estimate * (2 * M_PI);
-                vel_estimate_ = msg.Vel_Estimate * (2 * M_PI);
+                act_pos_estimate_ = msg.Pos_Estimate * (2 * M_PI);
+                act_vel_estimate_ = msg.Vel_Estimate * (2 * M_PI);
             }
         } break;
         case Get_Torques_msg_t::cmd_id: {
             if (Get_Torques_msg_t msg; try_decode(msg)) {
-                torque_target_ = msg.Torque_Target;
-                torque_estimate_ = msg.Torque_Estimate;
+                act_torque_target_ = msg.Torque_Target;
+                act_torque_estimate_ = msg.Torque_Estimate;
             }
         } break;
             // silently ignore unimplemented command IDs
